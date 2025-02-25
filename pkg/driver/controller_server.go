@@ -347,6 +347,60 @@ func (driver *Driver) createVolume(
 		return nil, status.Error(codes.Internal, errStr)
 	}
 
+	if driver.IsAccessProtocolNFS(createParameters) {
+		// check if block access type is requested with multi-node mode
+		log.Infof("About to create a new volume '%s' with size %d and options %+v", name, size, createParameters)
+		if volAccessType == model.BlockType {
+			return nil, status.Error(codes.InvalidArgument, "NFS volume provisioning is not supported with block access type")
+		}
+
+		// Get the StorageProvider from the information in the Secret
+		storageProvider, err := driver.GetStorageProvider(secrets)
+		if err != nil {
+			log.Error("err: ", err.Error())
+			return nil, status.Error(codes.Unavailable, fmt.Sprintf("Failed to get storage provider from secrets, %s", err.Error()))
+		}
+
+		createOptions := make(map[string]interface{})
+		for k, v := range createParameters {
+			// convert create options to snakecase before passing it to CSP
+			createOptions[util.ToSnakeCase(k)] = v
+		}
+
+		// extract the description if present
+		var description string
+		if val, ok := createOptions[descriptionKey]; ok {
+			description = fmt.Sprintf("%v", val)
+			delete(createOptions, descriptionKey)
+		}
+
+		// Build the volume context to be returned to the CO in the create response
+		// This same context will be used by the CO during Publish and Stage workflows
+		respVolContext := make(map[string]string)
+		if createParameters != nil {
+			// Copy the request parameters into resp context
+			respVolContext = createParameters
+		}
+
+		// Before we create the volume, we need to check for volume existence
+		// Create new share using the StorageProvider
+		log.Infof("About to create a new volume '%s' with size %d and options %+v", name, size, createOptions)
+		volume, err := storageProvider.CreateVolume(name, description, size, createOptions)
+		if err != nil {
+			log.Trace("Volume creation failed, err: " + err.Error())
+			return nil, status.Error(codes.Internal, fmt.Sprintf("Failed to create volume %s, %s", name, err.Error()))
+		}
+		// update volume context with volume parameters
+		updateVolumeContext(respVolContext, volume)
+		// Return newly created volume with volume context info
+		return &csi.Volume{
+			VolumeId:           volume.ID,
+			CapacityBytes:      volume.Size,
+			VolumeContext:      respVolContext,
+			AccessibleTopology: accessibilityRequirements.GetRequisite(),
+		}, nil
+	}
+
 	if val, ok := createParameters[protectionTemplateKey]; ok {
 		log.Infof("protectionTemplate parameter is moved and volumeGroups are used instead, removing %s=%s from the request", protectionTemplateKey, val)
 		delete(createParameters, protectionTemplateKey)

@@ -17,8 +17,9 @@
 # hpe-logcollector.sh
 #   This script collects log files and other diagnostics into a single
 #   tar file for each specified node, using kubectl to invoke
-#   hpe-logcollector.sh.  Log files for the HPE CSI controller
-#   containers are also collected from kubectl logs into a local file.
+#   hpe-logcollector.sh.  Log files for the HPE CSI controller sidecar
+#   containers and the CSP pods (which now log to an emptyDir, not host
+#   /var/log) are also collected from kubectl logs into local files.
 #
 
 # Finds a node that matches the $node_name and updates $node_name
@@ -165,6 +166,61 @@ then
 fi
 }
 
+# Collects CSP container logs via kubectl logs. The CSP logs to an emptyDir that
+# is wiped when its pod is replaced, so --previous is also captured to recover the
+# last terminated container's logs after a crash or restart (CON-2043, CON-3303).
+csp_log_collection() {
+node_selector=""
+if [[ ! -z $node_name ]]; then
+	node_selector="--field-selector=spec.nodeName=$node_name"
+fi
+
+# CSP pods all use the hpe-csp-sa service account, regardless of their app label.
+pod_list=$(kubectl get pods -n $namespace $node_selector \
+	-o jsonpath='{range .items[?(@.spec.serviceAccountName=="hpe-csp-sa")]}{.metadata.name}{" "}{end}')
+if [[ ! -z "$pod_list" ]]
+then
+	timestamp=`date '+%Y%m%d_%H%M%S'`
+	dest_log_dir="$dest_dir"
+	# Stage under the destination dir so no privileged /var/log write is needed.
+	tmp_log_dir="$dest_dir/.hpe-csp-logs-$timestamp"
+	hostname=$(cat /etc/hostname 2>/dev/null || hostname)
+	tar_file_name="hpe-csp-logs-$hostname-$timestamp.tar.gz"
+
+	mkdir -p $tmp_log_dir
+
+	for pod_name in $pod_list
+	do
+		container_list=$(kubectl get pod $pod_name -n $namespace -o jsonpath='{.spec.containers[*].name}')
+		for container_name in $container_list
+		do
+			timeout 30 kubectl logs $pod_name -n $namespace -c $container_name &> $tmp_log_dir/$pod_name.$container_name.log
+			# Previous instance exists only after a restart; drop the file if there is none.
+			if timeout 30 kubectl logs --previous $pod_name -n $namespace -c $container_name > $tmp_log_dir/$pod_name.$container_name.previous.log 2>/dev/null; then
+				[[ -s $tmp_log_dir/$pod_name.$container_name.previous.log ]] || rm -f $tmp_log_dir/$pod_name.$container_name.previous.log
+			else
+				rm -f $tmp_log_dir/$pod_name.$container_name.previous.log
+			fi
+		done
+	done
+
+	if [[ ! -z $(ls $tmp_log_dir) ]]
+	then
+		tar -czf $tar_file_name -C $tmp_log_dir . &> /dev/null
+		mv $tar_file_name $dest_log_dir &> /dev/null
+	fi
+
+	rm -rf $tmp_log_dir
+
+	if [[ -f "$dest_log_dir/$tar_file_name" ]]
+	then
+		echo "HPE CSP logs were collected into $dest_log_dir/$tar_file_name on host $hostname."
+	else
+		echo "Unable to collect HPE CSP log files."
+	fi
+fi
+}
+
 display_usage() {
 echo "Collect HPE storage diagnostic logs using kubectl."
 echo -e "\nUsage:"
@@ -231,6 +287,7 @@ dest_dir=$(cd "$dest_dir" && pwd)
 
 diagnostic_collection
 controller_log_collection
+csp_log_collection
 
 if [[ "$local_copy" == "true" ]]; then
 	echo "All HPE storage logs collected locally in: $dest_dir"
